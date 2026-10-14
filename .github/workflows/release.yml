@@ -1,0 +1,34 @@
+name: macOS Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, build, and publish
+    runs-on: macos-15
+    steps:
+      - name: Check out source and MediaRemote adapter
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Run tests
+        run: ./scripts/test.sh
+
+      - name: Build and verify app archive
+        run: ./scripts/build-app.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/LiveLyrics.zip
+          --title "LiveLyrics $GITHUB_REF_NAME"
+          --generate-notes
