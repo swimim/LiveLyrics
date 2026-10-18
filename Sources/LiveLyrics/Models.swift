@@ -14,6 +14,32 @@ struct TrackMetadata: Equatable, Sendable {
             .map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
     }
     var isQueryable: Bool { !title.trimmed.isEmpty && !artist.trimmed.isEmpty }
+
+    func isSameRecording(as other: TrackMetadata) -> Bool {
+        guard isQueryable, other.isQueryable, source == other.source,
+              title.normalized == other.title.normalized,
+              artist.normalized == other.artist.normalized else { return false }
+        if let sourceID, let otherID = other.sourceID, !sourceID.isEmpty, !otherID.isEmpty,
+           sourceID != otherID { return false }
+        if !album.trimmed.isEmpty, !other.album.trimmed.isEmpty,
+           album.normalized != other.album.normalized { return false }
+        if let duration, let otherDuration = other.duration,
+           duration.isFinite, otherDuration.isFinite, abs(duration - otherDuration) > 2 { return false }
+        return true
+    }
+
+    /// An incomplete same-app notification is not a new song unless one of
+    /// its supplied identity fields actually contradicts the current track.
+    func isIncompleteUpdate(of current: TrackMetadata) -> Bool {
+        guard !isQueryable, current.isQueryable, source == current.source else { return false }
+        if !title.trimmed.isEmpty, title.normalized != current.title.normalized { return false }
+        if !artist.trimmed.isEmpty, artist.normalized != current.artist.normalized { return false }
+        if let sourceID, !sourceID.isEmpty, let currentID = current.sourceID,
+           !currentID.isEmpty, sourceID != currentID { return false }
+        if !album.trimmed.isEmpty, !current.album.trimmed.isEmpty,
+           album.normalized != current.album.normalized { return false }
+        return true
+    }
 }
 
 extension String {
@@ -25,12 +51,17 @@ extension String {
 }
 
 enum PlaybackState: Sendable { case playing, paused, stopped, unknown }
+struct PlaybackPositionReference: Equatable, Sendable {
+    var elapsed: Double
+    var timestamp: Double
+}
 struct PlaybackSnapshot: Sendable {
     var track: TrackMetadata?
     var elapsed: Double?
     var anchor: Double = ProcessInfo.processInfo.systemUptime
     var rate: Double = 1
     var state: PlaybackState
+    var positionReference: PlaybackPositionReference? = nil
 }
 
 struct PlaybackClock {

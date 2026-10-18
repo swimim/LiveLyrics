@@ -12,22 +12,24 @@ import Combine
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let model = AppModel()
+    private let releaseChecker = ReleaseUpdateChecker()
     private var overlay: OverlayController?
     private var statusItem: NSStatusItem?
-    private var visibility: AnyCancellable?
-    private weak var lyricsItem: NSMenuItem?
-    private weak var lockItem: NSMenuItem?
-    private weak var statusTextItem: NSMenuItem?
     private weak var trackItem: NSMenuItem?
+    private var playbackObservation: AnyCancellable?
+    private var singingTimer: Timer?
+    private var singingFrame = 0
+    private lazy var restingIcon = Self.menuBarIcon()
+    private lazy var singingIcons = (0..<4).map { Self.menuBarIcon(frame: $0) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         if CommandLine.arguments.contains("--demo") { model.source = .demo }
-        overlay = OverlayController(model: model)
-        // Retain the Combine token for the whole menu-bar app lifetime.
-        visibility = model.$overlayVisible.sink { [weak self] visible in self?.overlay?.setVisible(visible) }
+        overlay = OverlayController(model: model, releaseChecker: releaseChecker)
+        overlay?.setVisible(true)
         createMenuBar()
         model.start()
+        releaseChecker.start()
         if let i = CommandLine.arguments.firstIndex(of: "--smoke-test"), CommandLine.arguments.indices.contains(i + 1), let seconds = Double(CommandLine.arguments[i + 1]) {
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { NSApp.terminate(nil) }
         }
@@ -40,77 +42,113 @@ import Combine
         track.isEnabled = false
         menu.addItem(track); trackItem = track
 
-        let status = NSMenuItem(title: model.lyricsState.message, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status); statusTextItem = status
-
-        menu.addItem(.separator())
-        let lyrics = NSMenuItem(title: "가사 표시", action: #selector(toggleLyrics(_:)), keyEquivalent: "")
-        lyrics.target = self; lyrics.state = model.overlayVisible ? .on : .off
-        menu.addItem(lyrics); lyricsItem = lyrics
-
-        let lock = NSMenuItem(title: "가사 잠금", action: #selector(toggleLyricsLock(_:)), keyEquivalent: "")
-        lock.target = self; lock.state = model.lyricsLocked ? .on : .off
-        menu.addItem(lock); lockItem = lock
-
-        menu.addItem(.separator())
-        let reconnect = NSMenuItem(title: "다시 연결", action: #selector(reconnect), keyEquivalent: "")
-        reconnect.target = self; menu.addItem(reconnect)
-        let refresh = NSMenuItem(title: "가사 새로고침", action: #selector(refreshLyrics), keyEquivalent: "")
-        refresh.target = self; menu.addItem(refresh)
-
-        let contact = NSMenuItem(title: "LRCLIB 연락처 등록/변경…", action: #selector(changeContact), keyEquivalent: "")
-        contact.target = self; menu.addItem(contact)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "LiveLyrics 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp; menu.addItem(quit)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem?.button?.image = NSImage(systemSymbolName: "text.quote", accessibilityDescription: "LiveLyrics")
-        statusItem?.button?.toolTip = "LiveLyrics · 메뉴에서 가사 표시와 연결을 설정"
+        statusItem?.button?.image = restingIcon
+        statusItem?.button?.toolTip = "LiveLyrics"
         statusItem?.menu = menu
         updateMenuState()
+        playbackObservation = model.$playbackState.combineLatest(model.$track)
+            .map { state, track in state == .playing && track != nil }
+            .removeDuplicates()
+            .sink { [weak self] playing in self?.updateSingingAnimation(playing: playing) }
+    }
+
+    private func updateSingingAnimation(playing: Bool) {
+        singingTimer?.invalidate(); singingTimer = nil
+        singingFrame = 0
+        guard playing else {
+            statusItem?.button?.image = restingIcon
+            return
+        }
+        statusItem?.button?.image = singingIcons[0]
+        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.singingFrame = (self.singingFrame + 1) % self.singingIcons.count
+                self.statusItem?.button?.image = self.singingIcons[self.singingFrame]
+            }
+        }
+        timer.tolerance = 0.02
+        // Keep singing while the menu itself is open, without touching the lyric clock.
+        RunLoop.main.add(timer, forMode: .common)
+        singingTimer = timer
+    }
+
+    private static func menuBarIcon(frame: Int? = nil) -> NSImage {
+        // A tiny singing stone: stepped outline, bright eyes and a microphone.
+        // Transparent details remain legible when macOS tints the template.
+        let pixels = [
+            "       ####       ",
+            "      ######      ",
+            "     ########     ",
+            "    ##########    ",
+            "   ############   ",
+            "  ##############  ",
+            "  ##############  ",
+            " #####  ###  #### ",
+            " #####  ###  #### ",
+            "##################",
+            "###   ###  #######",
+            "## # # ###########",
+            "##  #  ###########",
+            " ## # ########### ",
+            "  ##  ##########  ",
+            "  ## ##########   ",
+            " ##  ###  ###     ",
+            "     ###  ###     "
+        ]
+        var animatedPixels = pixels.map(Array.init)
+        if let frame {
+            // The mouth opens and closes next to the microphone; eyes blink on beat.
+            for row in 10...12 {
+                for column in 8...10 { animatedPixels[row][column] = "#" }
+            }
+            let mouthHeight = [1, 2, 3, 2][frame]
+            for row in 10..<(10 + mouthHeight) {
+                animatedPixels[row][9] = " "
+                if frame != 0 { animatedPixels[row][10] = " " }
+            }
+            if frame == 2 {
+                for column in [6, 7, 11, 12] { animatedPixels[7][column] = "#" }
+            }
+            // A small eighth note rises beside the head over the four-frame loop.
+            let noteRow = frame % 2
+            for (column, row) in [(16, noteRow), (17, noteRow), (16, noteRow + 1),
+                                  (16, noteRow + 2), (15, noteRow + 3), (16, noteRow + 3)] {
+                animatedPixels[row][column] = "#"
+            }
+        }
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            NSColor.black.setFill()
+            for (row, line) in animatedPixels.enumerated() {
+                for (column, pixel) in line.enumerated() where pixel == "#" {
+                    NSBezierPath(rect: NSRect(x: column, y: 17 - row, width: 1, height: 1)).fill()
+                }
+            }
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "LiveLyrics · 노래하는 돌 캐릭터"
+        return image
     }
 
     func menuWillOpen(_ menu: NSMenu) { updateMenuState() }
     private func updateMenuState() {
-        lyricsItem?.state = model.overlayVisible ? .on : .off
-        lockItem?.state = model.lyricsLocked ? .on : .off
-        statusTextItem?.title = model.lyricsState == .idle ? model.providerStatus : model.lyricsState.message
         if let track = model.track, !track.title.trimmed.isEmpty {
             trackItem?.title = track.artist.trimmed.isEmpty ? track.title : "\(track.title) · \(track.artist)"
         } else {
             trackItem?.title = model.source == .demo ? "오프라인 데모 준비 중" : "재생 중인 곡이 없어요"
         }
-        statusItem?.button?.toolTip = model.track?.title ?? "LiveLyrics · 가사를 \(model.overlayVisible ? "표시" : "숨김")"
-    }
-
-    @objc private func toggleLyrics(_ sender: NSMenuItem) { model.overlayVisible.toggle(); updateMenuState() }
-    @objc private func toggleLyricsLock(_ sender: NSMenuItem) { model.lyricsLocked.toggle(); updateMenuState() }
-    @objc private func reconnect() { model.connect(); updateMenuState() }
-    @objc private func refreshLyrics() { model.refresh(); updateMenuState() }
-
-    @objc private func changeContact() {
-        let alert = NSAlert()
-        alert.messageText = "LRCLIB 앱 식별 정보"
-        alert.informativeText = "곡을 조회할 때 곡명·아티스트·앨범·길이와 아래 연락처가 LRCLIB에 전송됩니다."
-        alert.addButton(withTitle: "저장")
-        alert.addButton(withTitle: "취소")
-        let field = NSTextField(string: model.contact)
-        field.placeholderString = "프로젝트 URL 또는 이메일"
-        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
-        alert.accessoryView = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        guard model.saveContact(field.stringValue) else {
-            let invalid = NSAlert()
-            invalid.messageText = "올바른 URL 또는 이메일을 입력해 주세요"
-            invalid.runModal()
-            return
-        }
-        updateMenuState()
+        statusItem?.button?.toolTip = model.track?.title ?? "LiveLyrics"
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        singingTimer?.invalidate(); singingTimer = nil
+        playbackObservation?.cancel(); playbackObservation = nil
         model.stop(); overlay?.close()
     }
 }

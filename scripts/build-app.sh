@@ -14,6 +14,10 @@ APP="$STAGING/LiveLyrics.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
 cp "$BIN/LiveLyrics" "$APP/Contents/MacOS/LiveLyrics"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" =~ ^v?([0-9]+\.)*[0-9]+$ ]]; then
+  RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$APP/Contents/Info.plist"
+fi
 ICONSET="$STAGING/AppIcon.iconset"
 mkdir -p "$ICONSET"
 for SIZE in 16 32 128 256 512; do
@@ -36,8 +40,11 @@ mkdir "$STAGING/verify"
 ditto -x -k "$STAGING/LiveLyrics.zip" "$STAGING/verify"
 codesign --verify --deep --strict "$STAGING/verify/LiveLyrics.app"
 cp "$STAGING/LiveLyrics.zip" dist/LiveLyrics.zip
-# Rename the previous generated bundle so a running app's mapped binary is untouched.
-if [[ -d dist/LiveLyrics.app ]]; then mv dist/LiveLyrics.app "$STAGING/Previous.app"; fi
-ditto --norsrc --noextattr "$APP" dist/LiveLyrics.app
+# Keep the bundle directory stable for Finder/FileProvider. rsync replaces changed
+# files by rename (never --inplace), preserving a running executable's mapped inode.
+mkdir -p dist/LiveLyrics.app
+rsync -a --delete --delay-updates "$APP/" dist/LiveLyrics.app/
+xattr -r -d com.apple.FinderInfo dist/LiveLyrics.app 2>/dev/null || true
+xattr -r -d com.apple.ResourceFork dist/LiveLyrics.app 2>/dev/null || true
 echo "Built: $PWD/dist/LiveLyrics.app"
 echo "Verified archive: $PWD/dist/LiveLyrics.zip"
