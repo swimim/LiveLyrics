@@ -12,12 +12,14 @@ import AppKit
     @Published var activeIndex: Int?
     @Published var positionKnown = false
     @Published var animateTransition = false
-    @Published var overlayVisible = true { didSet { updateTimer(); synchronize(animate: false) } }
     @Published var pointerInsideLyricsArea = false
+    @Published var autoShowLyrics = UserDefaults.standard.object(forKey: "autoShowLyrics") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoShowLyrics, forKey: "autoShowLyrics") }
+    }
     @Published var lyricsLocked = UserDefaults.standard.bool(forKey: "lyricsLocked") {
         didSet { UserDefaults.standard.set(lyricsLocked, forKey: "lyricsLocked") }
     }
-    @Published var contact: String = UserDefaults.standard.string(forKey: "lrclibContact") ?? ""
+    @Published var contact: String = "https://github.com/swimim/LiveLyrics"
     private(set) var clock = PlaybackClock()
     private var provider: NowPlayingProvider?
     private let repository: LyricsRepository
@@ -26,8 +28,12 @@ import AppKit
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var sleeping = false
+    private var refreshOnNextTrack = false
     var demo: MockNowPlayingProvider? { provider as? MockNowPlayingProvider }
     var overlayMessage: String? {
+        // Reconnecting clears metadata before the provider sends its first
+        // snapshot. Keep the loading surface visible throughout that gap.
+        if lyricsState == .loading { return lyricsState.message }
         guard track != nil else { return nil }
         if !track!.isQueryable { return "곡 정보를 확인하고 있어요" }
         if lyricsState == .synced && !positionKnown { return "재생 위치를 확인할 수 없어요" }
@@ -49,10 +55,7 @@ import AppKit
         return document.cues.lastIndex(where: { !$0.text.trimmed.isEmpty })
     }
     var hasDisplayableLyrics: Bool {
-        guard lyricsState == .synced, positionKnown else { return false }
-        if isLyricsFinished || isBeforeFirstLyric { return !document.cues.isEmpty }
-        guard let activeIndex, document.cues.indices.contains(activeIndex) else { return false }
-        return !document.cues[activeIndex].text.trimmed.isEmpty
+        lyricsState == .synced && positionKnown && document.cues.contains { !$0.text.trimmed.isEmpty }
     }
     init(repository: LyricsRepository = LyricsRepository()) { self.repository = repository }
     func start() {
@@ -71,10 +74,11 @@ import AppKit
         if var s = clock.snapshot { s.elapsed = clock.position(); s.anchor = ProcessInfo.processInfo.systemUptime; s.state = .paused; clock.snapshot = s }
         providerStatus = "잠자기 · 복귀 후 다시 연결합니다"
     }
-    func connect() {
+    func connect(showLoadingMessage: Bool = false) {
         provider?.stop(); request?.cancel(); _ = generation.begin(nil)
         track = nil; document = LyricsDocument(); activeIndex = nil; clock.snapshot = nil
-        lyricsState = .idle; positionKnown = false; playbackState = .unknown; animateTransition = false
+        lyricsState = showLoadingMessage ? .loading : .idle
+        positionKnown = false; playbackState = .unknown; animateTransition = false
         switch source {
         case .demo: provider = MockNowPlayingProvider()
         case .mediaRemote: provider = MediaRemoteProvider()
@@ -86,7 +90,21 @@ import AppKit
     }
     func receive(_ incoming: PlaybackSnapshot) {
         var snapshot = incoming
-        let predicted = clock.position()
+        // Play/pause events can omit IDs, album or duration. Keep the loaded
+        // track identity so that a metadata-only change does not clear lyrics.
+        if let current = track, let reported = snapshot.track,
+           reported.isSameRecording(as: current) || reported.isIncompleteUpdate(of: current) {
+            snapshot.track = current
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let predicted = clock.position(at: now)
+        // MediaRemote can omit elapsed time for a brief play/pause update.
+        // Reuse the last clock position for the same track instead of making
+        // the lyrics view temporarily lose its synchronized state.
+        if snapshot.track?.key == track?.key, snapshot.elapsed == nil {
+            snapshot.elapsed = predicted ?? clock.snapshot?.elapsed
+            snapshot.anchor = now
+        }
         if snapshot.track == nil, let current = track {
             switch snapshot.state {
             case .unknown:
@@ -109,11 +127,31 @@ import AppKit
             case .playing, .paused:
                 // Retain lyrics and use the previous clock if position is absent.
                 snapshot.track = current
-                if snapshot.elapsed == nil { snapshot.elapsed = predicted }
+                if snapshot.elapsed == nil { snapshot.elapsed = predicted; snapshot.anchor = now }
             }
         }
         let changed = snapshot.track?.key != track?.key
-        let seeking = predicted.flatMap { p in snapshot.elapsed.map { abs(p - $0) > 0.6 } } ?? true
+        if !changed, track != nil {
+            if snapshot.state == .unknown { snapshot.state = playbackState }
+            if let reference = snapshot.positionReference,
+               let previousReference = clock.snapshot?.positionReference,
+               (reference == previousReference || reference.timestamp < previousReference.timestamp),
+               let predicted {
+                // State and position notifications arrive independently. Reused
+                // or older anchors must not rewind the clock or add paused time.
+                // Keep the newest reference so a delayed packet cannot make a
+                // later stale packet look like a fresh correction.
+                snapshot.elapsed = predicted
+                snapshot.anchor = now
+                snapshot.positionReference = previousReference
+            } else if snapshot.positionReference == nil,
+                      incoming.elapsed == nil {
+                // Preserve the anchor identity across metadata-only packets.
+                snapshot.positionReference = clock.snapshot?.positionReference
+            }
+        }
+        let incomingPosition = PlaybackClock(snapshot: snapshot).position(at: now)
+        let seeking = predicted.flatMap { p in incomingPosition.map { abs(p - $0) > 0.6 } } ?? true
         clock.snapshot = snapshot; positionKnown = clock.position() != nil; playbackState = snapshot.state
         track = snapshot.track
         if changed {
@@ -123,25 +161,21 @@ import AppKit
             if source == .demo {
                 document = (try? LRCParser.parse(MockNowPlayingProvider.lrc)) ?? LyricsDocument()
                 lyricsState = .synced
-            } else if track.isQueryable { load(track) }
+            } else if track.isQueryable {
+                let shouldRefresh = refreshOnNextTrack
+                refreshOnNextTrack = false
+                load(track, refresh: shouldRefresh)
+            }
             else { lyricsState = .failed("곡 정보를 확인하고 있어요") }
         }
         synchronize(animate: !changed && !seeking); updateTimer()
     }
-    @discardableResult func saveContact(_ value: String) -> Bool {
-        guard LyricsRepository.validContact(value) else { return false }
-        contact = value.trimmed
-        UserDefaults.standard.set(contact, forKey: "lrclibContact")
-        refresh()
-        return true
-    }
     func refresh() { if let track, source != .demo { load(track, refresh: true) } }
+    func reconnectAndRefresh() {
+        refreshOnNextTrack = source != .demo
+        connect(showLoadingMessage: true)
+    }
     private func load(_ track: TrackMetadata, refresh: Bool = false) {
-        // Pick up a contact saved outside this process as well, then use the
-        // current value for request validation and its User-Agent.
-        if let savedContact = UserDefaults.standard.string(forKey: "lrclibContact"), savedContact != contact {
-            contact = savedContact
-        }
         request?.cancel()
         let token = generation.begin(track.key), contact = self.contact
         lyricsState = .loading
@@ -171,26 +205,35 @@ import AppKit
             }
         }
     }
+    // Compensate for the observed one-second lyric lag without changing the
+    // playback clock, track-end detection, or the existing transition animation.
+    static let lyricsLeadSeconds: Double = 1
+
     func synchronize(animate: Bool) {
         if let duration = track?.duration, duration.isFinite, duration > 0,
            let position = clock.position(), position >= duration {
             clearCurrentTrack()
             return
         }
-        let next = clock.position().map { LyricsSynchronizer.index(in: document, position: $0) } ?? nil
+        let next = clock.position().map {
+            LyricsSynchronizer.index(in: document, position: $0 + Self.lyricsLeadSeconds)
+        } ?? nil
         if next != activeIndex {
             animateTransition = animate && activeIndex != nil && next == activeIndex.map { $0 + 1 }
             activeIndex = next
         } else if !animate { animateTransition = false }
     }
     private func updateTimer() {
-        let needed = !sleeping && overlayVisible && playbackState == .playing && positionKnown &&
+        let needed = !sleeping && playbackState == .playing && positionKnown &&
             (lyricsState == .synced || track?.duration != nil)
         if !needed { timer?.invalidate(); timer = nil }
         else if timer == nil {
-            timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            let syncTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.synchronize(animate: true) }
             }
+            syncTimer.tolerance = 0.002
+            RunLoop.main.add(syncTimer, forMode: .common)
+            timer = syncTimer
         }
     }
     private func clearCurrentTrack() {

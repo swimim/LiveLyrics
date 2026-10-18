@@ -23,13 +23,19 @@ struct MediaRemotePayload: Decodable {
         let hasSession = bundleIdentifier != nil || title != nil
         let track = hasSession ? TrackMetadata(source: bundleIdentifier ?? "MediaRemote", sourceID: uniqueIdentifier, title: title ?? "", artist: artist ?? "", album: album ?? "", duration: durationMicros.map { $0 / 1_000_000 }) : nil
         let state: PlaybackState = playing.map { $0 ? .playing : .paused } ?? .unknown
-        let rate = playbackRate.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil } ?? 1
+        let rate = playbackRate.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 1
         var elapsed = elapsedTimeMicros.flatMap { $0.isFinite ? $0 / 1_000_000 : nil }
+        let positionReference = elapsed.flatMap { position in
+            timestampEpochMicros.flatMap { timestamp in
+                timestamp.isFinite ? PlaybackPositionReference(elapsed: position, timestamp: timestamp / 1_000_000) : nil
+            }
+        }
         // Convert the raw Unix anchor exactly once, then use the monotonic clock.
         if state == .playing, let stamp = timestampEpochMicros, stamp.isFinite, let p = elapsed {
             elapsed = p + max(0, epoch - stamp / 1_000_000) * rate
         }
-        return PlaybackSnapshot(track: track, elapsed: elapsed, anchor: uptime, rate: rate, state: state)
+        return PlaybackSnapshot(track: track, elapsed: elapsed, anchor: uptime, rate: rate, state: state,
+                                positionReference: positionReference)
     }
 }
 
@@ -45,6 +51,11 @@ struct MediaRemotePayload: Decodable {
     private var timeoutTask: Task<Void, Never>?
     private var running = false
     private var received = false
+    private var positionTimer: Timer?
+    private var positionProcess: Process?
+    private var positionTimeout: Task<Void, Never>?
+    private var latestSnapshot: PlaybackSnapshot?
+    private var snapshotRevision = 0
     static var resourceDirectory: URL {
         if let path = ProcessInfo.processInfo.environment["LIVELYRICS_RESOURCES"] { return URL(fileURLWithPath: path) }
         return Bundle.main.resourceURL ?? URL(fileURLWithPath: ".")
@@ -65,7 +76,7 @@ struct MediaRemotePayload: Decodable {
         }
         let process = Process(), pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
-        process.arguments = [script.path, framework.path, "stream", "--no-diff", "--micros", "--no-artwork", "--allow-missing-title", "--debounce=100"]
+        process.arguments = [script.path, framework.path, "stream", "--no-diff", "--micros", "--no-artwork", "--allow-missing-title", "--debounce=25"]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -99,8 +110,83 @@ struct MediaRemotePayload: Decodable {
             received = true; timeoutTask?.cancel()
             let snapshot = event.payload.snapshot()
             onStatus?(snapshot.track == nil ? "MediaRemote 응답 수신 · 활성 세션 없음 또는 정보 접근 불가" : "MediaRemote 연결됨")
+            snapshotRevision += 1
+            latestSnapshot = snapshot
+            updatePositionPolling()
             onSnapshot?(snapshot)
         }
+    }
+    private func updatePositionPolling() {
+        guard latestSnapshot?.state == .playing else {
+            positionTimer?.invalidate(); positionTimer = nil
+            cancelPositionQuery()
+            return
+        }
+        guard positionTimer == nil else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.pollPosition() }
+        }
+        timer.tolerance = 0.02
+        RunLoop.main.add(timer, forMode: .common)
+        positionTimer = timer
+        pollPosition() // Refresh immediately on resume, then every second.
+    }
+    // A periodic result must never restore a previous song or a paused session.
+    static func positionUpdate(_ data: Data, current: PlaybackSnapshot?) -> PlaybackSnapshot? {
+        guard data.count <= 1_048_576, current?.state == .playing,
+              let track = current?.track,
+              let payload = try? JSONDecoder().decode(MediaRemotePayload.self, from: data) else { return nil }
+        let snapshot = payload.snapshot()
+        guard snapshot.state == .playing, snapshot.elapsed != nil,
+              snapshot.track?.isSameRecording(as: track) == true else { return nil }
+        return snapshot
+    }
+    private func pollPosition() {
+        guard running, latestSnapshot?.state == .playing, positionProcess == nil else { return }
+        let token = generation, revision = snapshotRevision
+        let query = Process(), output = Pipe()
+        let root = Self.resourceDirectory
+        query.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        query.arguments = [root.appendingPathComponent("mediaremote-adapter.pl").path,
+                           root.appendingPathComponent("MediaRemoteAdapter.framework").path,
+                           "get", "--micros", "--no-artwork", "--allow-missing-title"]
+        query.standardOutput = output
+        query.standardError = FileHandle.nullDevice
+        query.terminationHandler = { [weak self] process in
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            Task { @MainActor [weak self] in
+                guard let self, self.positionProcess === process else { return }
+                self.positionProcess = nil
+                self.positionTimeout?.cancel(); self.positionTimeout = nil
+                guard self.running, self.generation == token,
+                      self.snapshotRevision == revision, process.terminationStatus == 0,
+                      let snapshot = Self.positionUpdate(data, current: self.latestSnapshot) else { return }
+                self.latestSnapshot = snapshot
+                self.onSnapshot?(snapshot)
+            }
+        }
+        positionProcess = query
+        do {
+            try query.run()
+            positionTimeout = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(2.5))
+                guard !Task.isCancelled, let self, self.positionProcess === query else { return }
+                self.cancelPositionQuery()
+            }
+        } catch { positionProcess = nil }
+    }
+    private func cancelPositionQuery() {
+        positionTimeout?.cancel(); positionTimeout = nil
+        if let query = positionProcess {
+            query.terminationHandler = nil
+            if query.isRunning {
+                query.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                    if query.isRunning { kill(query.processIdentifier, SIGKILL) }
+                }
+            }
+        }
+        positionProcess = nil
     }
     private func terminated(token: Int) {
         guard generation == token, running else { return }
@@ -116,6 +202,8 @@ struct MediaRemotePayload: Decodable {
         }
     }
     private func cleanup() {
+        positionTimer?.invalidate(); positionTimer = nil
+        cancelPositionQuery(); latestSnapshot = nil
         timeoutTask?.cancel(); pipe?.fileHandleForReading.readabilityHandler = nil
         if let process {
             process.terminationHandler = nil
